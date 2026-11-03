@@ -20,19 +20,61 @@ function demoRuns(){let seed=7;const r=()=>(seed=(seed*16807)%2147483647)/214748
 const runs=()=>(state.demo?demoRuns():state.runs).slice().sort((a,b)=>new Date(a.date)-new Date(b.date));
 
 /* ---------- Strava ---------- */
-async function stravaToken(){const s=state.strava,c=state.cfg;if(!s.access_token)throw Error('Not connected');
- if(s.expires_at*1000<Date.now()+60e3){const r=await fetch('https://www.strava.com/oauth/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client_id:c.cid,client_secret:c.csec,grant_type:'refresh_token',refresh_token:s.refresh_token})});
-  const j=await r.json();if(!r.ok)throw Error('Refresh failed: '+(j.message||r.status));Object.assign(s,j);save()}return s.access_token}
-async function sget(p){const t=await stravaToken();const r=await fetch('https://www.strava.com/api/v3'+p,{headers:{Authorization:'Bearer '+t}});if(!r.ok)throw Error('Strava '+r.status+' '+(await r.text()).slice(0,120));return r.json()}
+const STANDALONE=matchMedia('(display-mode: standalone)').matches||navigator.standalone===true;
+const SCOPE='read,activity:read_all';
+let diag=[];const dlog=(ok,m)=>{diag.push((ok===null?'… ':ok?'✅ ':'❌ ')+m);const el=$('#diag');if(el)el.textContent=diag.join('\n')};
+async function tokenPost(params){let r;
+ // form-encoded body = "simple" CORS request, no preflight needed
+ try{r=await fetch('https://www.strava.com/oauth/token',{method:'POST',body:new URLSearchParams(params)})}catch(e){throw Error('Could not reach Strava (network/CORS: '+e.message+'). Check internet and try again.')}
+ let j={};try{j=await r.json()}catch(e){}
+ if(!r.ok){const f=(j.errors||[]).map(x=>(x.resource||'')+' '+x.field+' '+x.code).join(', ');let m='Strava '+r.status+' '+(j.message||'')+(f?' ['+f+']':'');
+  if(/client_id|client_secret|Application/i.test(f))m+=' → Client ID or Client Secret is wrong. Re-copy both from strava.com/settings/api (no spaces).';
+  else if(/code/i.test(f))m+=' → This approval code is invalid, expired or already used. Tap Connect Strava again.';
+  else if(/refresh/i.test(f))m+=' → Saved login expired. Tap Disconnect, then Connect Strava again.';
+  throw Error(m)}return j}
+async function stravaToken(){const s=state.strava,c=state.cfg;if(!s.access_token)throw Error('Not connected. Tap Connect Strava first.');
+ if(!s.expires_at||s.expires_at*1000<Date.now()+60e3){const j=await tokenPost({client_id:c.cid,client_secret:c.csec,grant_type:'refresh_token',refresh_token:s.refresh_token});Object.assign(s,j);save()}return s.access_token}
+async function sget(p){const t=await stravaToken();let r;try{r=await fetch('https://www.strava.com/api/v3'+p,{headers:{Authorization:'Bearer '+t}})}catch(e){throw Error('Could not reach Strava API ('+e.message+')')}
+ if(!r.ok){const b=(await r.text()).slice(0,200);let m='Strava API '+r.status+' '+b;
+  if(r.status==401&&/activity:read/.test(b))m='Strava did not grant permission to read activities. Tap Disconnect, Connect Strava again and leave "View data about your activities" ticked.';
+  else if(r.status==401)m+=' → Tap Disconnect, then Connect Strava again.';else if(r.status==429)m='Strava rate limit reached. Wait 15 minutes and try again.';
+  throw Error(m)}return r.json()}
 function connect(){const c=state.cfg;if(!c.cid||!c.csec)return alert('Paste your Client ID and Client Secret first, then tap Save.');
- location.href='https://www.strava.com/oauth/authorize?'+new URLSearchParams({client_id:c.cid,redirect_uri:APP_URL,response_type:'code',approval_prompt:'auto',scope:'read,activity:read_all'})}
+ if(!/^\d+$/.test(c.cid))return alert('Client ID should be a number only (e.g. 123456). Please re-copy it.');
+ LS.setItem('r42_pending',Date.now());
+ location.href='https://www.strava.com/oauth/authorize?'+new URLSearchParams({client_id:c.cid,redirect_uri:APP_URL,response_type:'code',approval_prompt:'force',scope:SCOPE})}
+function parseReturn(str){str=String(str||'').trim();let q;try{q=new URL(str).searchParams}catch(e){q=new URLSearchParams(str.replace(/^[^?]*\?/,'').replace(/#.*/,''))}
+ if(!q.has('code')&&!q.has('error')&&/^[0-9a-f]{20,}$/i.test(str))q=new URLSearchParams({code:str,scope:''});return q}
+async function exchange(q){if(q.get('error'))throw Error(q.get('error')=='access_denied'?'You tapped Cancel on Strava. Tap Connect Strava and choose Authorize.':'Strava: '+q.get('error'));
+ const c=state.cfg;if(!c.cid||!c.csec)throw Error('Client ID/Secret are not saved in this app. Enter them in Settings, Save, then paste the link again.');
+ const sc=q.get('scope');if(sc&&!/activity:read/.test(sc))throw Error('You unticked "View data about your activities". Tap Connect Strava again and keep it ticked.');
+ const j=await tokenPost({client_id:c.cid,client_secret:c.csec,code:q.get('code'),grant_type:'authorization_code'});
+ state.strava=j;state.strava.scope=sc||'';state.demo=false;LS.removeItem('r42_pending');save();return j}
 async function handleReturn(){const q=new URLSearchParams(location.search);if(!q.has('code')&&!q.has('error'))return;history.replaceState(null,'',APP_URL);
- if(q.get('error'))return alert('Strava: '+q.get('error'));const c=state.cfg;
- try{const r=await fetch('https://www.strava.com/oauth/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client_id:c.cid,client_secret:c.csec,code:q.get('code'),grant_type:'authorization_code'})});
-  const j=await r.json();if(!r.ok)throw Error(j.message||r.status);state.strava=j;state.demo=false;save();await syncStrava()}catch(e){alert('Could not connect Strava: '+e.message)}}
-async function syncStrava(){setSrc('Syncing Strava…');try{const out=[];for(let p=1;p<=20;p++){const a=await sget('/athlete/activities?per_page=200&page='+p);if(!a.length)break;out.push(...a);if(a.length<200)break}
+ try{if(!state.cfg.cid||!state.cfg.csec){ // iPhone home-screen app: Strava returned to Safari, which has separate storage
+   showPaste(location.origin+APP_URL.replace(location.origin,'')+'?'+q.toString());return}
+  await exchange(q);await syncStrava();
+  if(!STANDALONE&&navigator.standalone===false&&/iPhone|iPad/.test(navigator.userAgent))alert('Strava connected in Safari. If you use the home-screen app, open Settings there and use "Paste Strava link".')}
+ catch(e){alert('Could not connect Strava: '+e.message)}}
+function showPaste(url){document.querySelector('nav [data-v="set"]')?.click();const d=document.createElement('div');d.className='card';
+ d.innerHTML='<h2>Almost done</h2><p>Strava approved, but this browser does not have your Client ID/Secret (the home-screen app keeps its own storage). Copy this link, open the <b>GACD Run</b> home-screen app → Settings → <b>Paste Strava link</b>:</p><textarea readonly style="width:100%;height:80px">'+esc(url)+'</textarea><button id="cpy">Copy link</button>';
+ $('#v-set').prepend(d);$('#cpy').onclick=()=>navigator.clipboard.writeText(url).then(()=>alert('Copied. Now open the home-screen app.'),()=>alert('Select the text and copy it manually.'))}
+async function syncStrava(){setSrc('Syncing Strava…');try{const out=[];for(let p=1;p<=20;p++){const a=await sget('/athlete/activities?per_page=200&page='+p);if(!Array.isArray(a)||!a.length)break;out.push(...a);if(a.length<200)break}
   const rs=out.filter(a=>/Run/.test(a.sport_type||a.type)).map(a=>({id:'s'+a.id,date:a.start_date_local.replace('Z',''),km:+(a.distance/1000).toFixed(2),sec:a.moving_time,name:a.name,hr:a.average_heartrate,elev:a.total_elevation_gain,src:'strava'}));
-  state.runs=state.runs.filter(r=>r.src!=='strava').concat(rs);state.strava.last=Date.now();save();render();alert('Synced '+rs.length+' runs from Strava.')}catch(e){alert('Sync failed: '+e.message)}render()}
+  state.runs=state.runs.filter(r=>r.src!=='strava').concat(rs);state.strava.last=Date.now();save();render();alert('Synced '+rs.length+' runs from Strava ('+out.length+' activities checked).')}catch(e){alert('Sync failed: '+e.message)}render()}
+async function testConn(){diag=[];const c=state.cfg,s=state.strava;
+ dlog(true,'App version r42-v2 · '+(STANDALONE?'home-screen app':'browser tab')+' · redirect '+APP_URL);
+ dlog(!!c.cid&&/^\d+$/.test(c.cid),'Client ID saved'+(c.cid&&!/^\d+$/.test(c.cid)?' (should be digits only)':''));
+ dlog(!!c.csec&&c.csec.length>=30,'Client Secret saved'+(c.csec&&c.csec.length<30?' (looks too short)':''));
+ dlog(true,'Strava app must have Authorization Callback Domain = '+location.hostname);
+ try{const r=await fetch('https://www.strava.com/oauth/token',{method:'POST',body:new URLSearchParams({client_id:c.cid||'0',client_secret:c.csec||'x',grant_type:'refresh_token',refresh_token:'test'})});const j=await r.json().catch(()=>({}));
+  dlog(true,'Reached Strava token server (HTTP '+r.status+', CORS OK)');const f=JSON.stringify(j.errors||'');
+  dlog(!/client_id|client_secret|Application/i.test(f),/client_id|client_secret|Application/i.test(f)?'Strava rejects this Client ID/Secret: re-copy them':'Client ID/Secret accepted by Strava')}catch(e){dlog(false,'Cannot reach Strava token server: '+e.message);return}
+ if(!s.access_token){dlog(false,'Not connected yet → tap Connect Strava (or Paste Strava link)');return}
+ dlog(!s.scope||/activity:read/.test(s.scope),'Granted scope: '+(s.scope||'unknown'));
+ try{await stravaToken();dlog(true,'Access token valid until '+new Date(s.expires_at*1000).toLocaleString())}catch(e){dlog(false,'Token refresh: '+e.message);return}
+ try{const a=await sget('/athlete');dlog(true,'Athlete: '+(a.firstname||'')+' '+(a.lastname||''))}catch(e){dlog(false,e.message)}
+ try{const a=await sget('/athlete/activities?per_page=5');dlog(true,'Read activities OK ('+a.length+' recent)')}catch(e){dlog(false,e.message)}}
 
 /* ---------- imports ---------- */
 function parseCSV(t){const rows=[];let row=[],f='',q=false;for(let i=0;i<t.length;i++){const c=t[i];if(q){if(c=='"'){if(t[i+1]=='"'){f+='"';i++}else q=false}else f+=c}else if(c=='"')q=true;else if(c==','){row.push(f);f=''}else if(c=='\n'||c=='\r'){if(c=='\r'&&t[i+1]=='\n')i++;row.push(f);rows.push(row);row=[];f=''}else f+=c}if(f||row.length){row.push(f);rows.push(row)}return rows}
@@ -126,17 +168,19 @@ function rTips(rs){const r=readiness(rs),p=predict(rs),ez=p?p.t/M*1.12:null,adv=
 function rSet(){const c=state.cfg,s=state.strava;$('#v-set').innerHTML=`
  <div class="card"><h2>Connect Strava</h2><ol>
  <li>On a computer or phone, open <a href="https://www.strava.com/settings/api" target="_blank" rel="noopener">strava.com/settings/api</a> and create an app (any name, e.g. "GACD Run 42.2"; Website: <code>${esc(APP_URL)}</code>).</li>
- <li>Set <b>Authorization Callback Domain</b> to <code>${esc(location.hostname)}</code>.</li>
+ <li>Set <b>Authorization Callback Domain</b> to exactly <code>${esc(location.hostname)}</code> (no https://, no slash, no /marathon-2027).</li>
  <li>Copy the <b>Client ID</b> and <b>Client Secret</b> into the boxes below and tap Save.</li><li>Tap <b>Connect Strava</b>, approve, then tap <b>Sync</b> any time.</li></ol>
  <label>Client ID</label><input id="cid" inputmode="numeric" value="${esc(c.cid||'')}"><label>Client Secret</label><input id="csec" type="password" value="${esc(c.csec||'')}">
- <div class="row"><button id="sv" class="btn2">Save</button><button id="cn">Connect Strava</button>${s.access_token?'<button id="sy">Sync</button><button id="dc" class="btn2">Disconnect</button>':''}</div>
+ <div class="row"><button id="sv" class="btn2">Save</button><button id="cn">Connect Strava</button>${s.access_token?'<button id="sy">Sync</button><button id="dc" class="btn2">Disconnect</button>':''}<button id="tc" class="btn2">Test connection</button></div>
+ <details ${STANDALONE?'open':''}><summary>Paste Strava link (iPhone home-screen app)</summary><p class="muted">If Strava opened in Safari after you tapped Authorize, copy the full address from Safari (it contains <code>code=</code>) and paste it here.</p><textarea id="pl" style="width:100%;height:70px" placeholder="https://alesilee119.github.io/marathon-2027/?state=&code=..."></textarea><button id="pb">Finish connecting</button></details>
+ <pre id="diag" class="muted" style="white-space:pre-wrap"></pre>
  <p class="muted">${s.access_token?`Connected${s.athlete?' as '+esc(s.athlete.firstname||''):''}. Last sync: ${s.last?new Date(s.last).toLocaleString():'never'}.`:'Not connected.'} Your keys and data stay only on this device (browser storage); nothing is sent anywhere except Strava.</p></div>
  <div class="card"><h2>Import files</h2><p class="muted">Strava → Settings → My Account → Download or Delete Your Account → Request archive. Upload <b>activities.csv</b> and/or <b>.gpx</b> files.</p><input type="file" id="fi" multiple accept=".csv,.gpx"></div>
  <div class="card"><h2>Add a run manually</h2><div class="row"><div><label>Date</label><input type="date" id="md" value="${ymd(Date.now())}"></div><div><label>Distance km</label><input id="mk2" inputmode="decimal" placeholder="5.0"></div><div><label>Time (h:mm:ss)</label><input id="mt" placeholder="0:32:00"></div></div><button id="ma">Add run</button></div>
  <div class="card"><h2>Demo data</h2><label><input type="checkbox" id="dm" style="width:auto" ${state.demo?'checked':''}> Show SAMPLE data (not your runs) to preview the app</label></div>
  <div class="card"><button class="btn2" id="wipe">Erase all my data on this device</button></div>`;
  const rd=()=>{c.cid=$('#cid').value.trim();c.csec=$('#csec').value.trim();save()};$('#sv').onclick=()=>{rd();alert('Saved on this device.')};$('#cn').onclick=()=>{rd();connect()};
- if($('#sy'))$('#sy').onclick=syncStrava;if($('#dc'))$('#dc').onclick=()=>{state.strava={};state.runs=state.runs.filter(r=>r.src!='strava');save();render()};
+ if($('#sy'))$('#sy').onclick=syncStrava;$('#tc').onclick=()=>{rd();testConn()};$('#pb').onclick=async()=>{rd();try{await exchange(parseReturn($('#pl').value));await syncStrava()}catch(e){alert('Could not connect Strava: '+e.message)}};if($('#dc'))$('#dc').onclick=()=>{state.strava={};state.runs=state.runs.filter(r=>r.src!='strava');save();render()};
  $('#dm').onchange=e=>{state.demo=e.target.checked;save();render()};
  $('#wipe').onclick=()=>{if(confirm('Erase all runs, plan and Strava keys from this device?')){LS.clear();location.reload()}};
  $('#fi').onchange=async e=>{let n=0;for(const f of e.target.files){try{const t=await f.text();n+=/\.csv$/i.test(f.name)?importCSV(t):importGPX(t,f.name)}catch(x){alert(x.message)}}state.demo=false;save();render();alert('Imported '+n+' runs.')};
@@ -145,7 +189,7 @@ function rSet(){const c=state.cfg,s=state.strava;$('#v-set').innerHTML=`
 
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('on',x==b));document.querySelectorAll('.view').forEach(v=>v.classList.toggle('hidden',v.id!='v-'+b.dataset.v));scrollTo(0,0);if(b.dataset.v=='dash')rDash(runs());if(b.dataset.v=='plan')$('#curwk')?.scrollIntoView()});
 addEventListener('resize',()=>rDash(runs()));
-if('serviceWorker'in navigator)navigator.serviceWorker.register('sw.js');
+if('serviceWorker'in navigator)navigator.serviceWorker.register('sw.js',{updateViaCache:'none'}).then(r=>r.update());
 (async()=>{const q=new URLSearchParams(location.search);if(q.has('demo')){state.demo=true;save()}render();await handleReturn();
  if(q.has('demo')&&!state.plan)buildPlan(new Date(DEF_RACE+'T00:00'));if(q.get('view'))document.querySelector(`nav [data-v="${q.get('view')}"]`)?.click();
  if(state.strava.access_token&&!state.demo&&Date.now()-(state.strava.last||0)>6*36e5)syncStrava().catch(()=>{})})();
