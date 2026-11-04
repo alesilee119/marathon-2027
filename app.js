@@ -3,8 +3,9 @@ const APP_URL=location.origin+location.pathname.replace(/index\.html$/,'');
 const $=s=>document.querySelector(s), LS=localStorage;
 const J=(k,d)=>{try{return JSON.parse(LS.getItem(k))??d}catch(e){return d}}, S=(k,v)=>LS.setItem(k,JSON.stringify(v));
 const DAY=864e5, M=42.195;
-let state={runs:J('r42_runs',[]),strava:J('r42_strava',{}),cfg:J('r42_cfg',{}),plan:J('r42_plan',null),demo:J('r42_demo',false)};
-function save(){S('r42_runs',state.runs);S('r42_strava',state.strava);S('r42_cfg',state.cfg);S('r42_plan',state.plan);S('r42_demo',state.demo)}
+let state={runs:J('r42_runs',[]),strava:J('r42_strava',{}),cfg:J('r42_cfg',{}),plan:J('r42_plan',null),demo:J('r42_demo',false),be:J('r42_be',{})};
+if(state.demo&&(state.strava.access_token||state.runs.some(r=>r.src=='strava')))state.demo=false;
+function save(){S('r42_runs',state.runs);S('r42_strava',state.strava);S('r42_cfg',state.cfg);S('r42_plan',state.plan);S('r42_demo',state.demo);S('r42_be',state.be)}
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmtT=s=>{s=Math.round(s);const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return(h?h+':'+String(m).padStart(2,'0'):m)+':'+String(x).padStart(2,'0')};
 const fmtP=spk=>isFinite(spk)&&spk>0?fmtT(spk)+'/km':'–';
@@ -59,11 +60,19 @@ async function handleReturn(){const q=new URLSearchParams(location.search);if(!q
 function showPaste(url){document.querySelector('nav [data-v="set"]')?.click();const d=document.createElement('div');d.className='card';
  d.innerHTML='<h2>Almost done</h2><p>Strava approved, but this browser does not have your Client ID/Secret (the home-screen app keeps its own storage). Copy this link, open the <b>GACD Run</b> home-screen app → Settings → <b>Paste Strava link</b>:</p><textarea readonly style="width:100%;height:80px">'+esc(url)+'</textarea><button id="cpy">Copy link</button>';
  $('#v-set').prepend(d);$('#cpy').onclick=()=>navigator.clipboard.writeText(url).then(()=>alert('Copied. Now open the home-screen app.'),()=>alert('Select the text and copy it manually.'))}
+const RUNTYPES=['Run','TrailRun','VirtualRun'];
+const BE=[['400m',.4],['1/2 mile',.8047],['1K',1],['1 mile',1.6093],['2 mile',3.2187],['5K',5],['10K',10],['15K',15],['10 mile',16.0934],['20K',20],['Half-Marathon',21.0975],['30K',30],['Marathon',42.195]];
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function dedupe(){const sid=new Set(state.runs.filter(r=>r.src=='strava').map(r=>r.id.slice(1)));const pri=r=>r.src=='strava'?0:1;const seen=new Set();
+ state.runs=state.runs.filter(r=>r.km>0&&r.sec>0&&!(r.src!='strava'&&sid.has(String(r.id).slice(1)))).sort((a,b)=>pri(a)-pri(b)).filter(r=>{const k=String(r.date).slice(0,16)+'|'+Math.round(r.km*10);if(seen.has(k))return false;seen.add(k);return true})}
+async function fetchBests(max=60){const todo=state.runs.filter(r=>r.src=='strava'&&r.km>=.39&&!state.be[r.id]).sort((a,b)=>b.km-a.km||new Date(b.date)-new Date(a.date)).slice(0,max);let n=0;
+ for(const r of todo){setSrc('Best efforts '+(++n)+'/'+todo.length+'…');try{const a=await sget('/activities/'+r.id.slice(1));state.be[r.id]=(a.best_efforts||[]).map(e=>[e.name,e.elapsed_time])}catch(e){if(/rate limit|429/.test(e.message))break;}save();await sleep(350)}
+ return state.runs.filter(r=>r.src=='strava'&&r.km>=.39&&!state.be[r.id]).length}
 async function syncStrava(){setSrc('Syncing Strava…');try{const out=[];for(let p=1;p<=20;p++){const a=await sget('/athlete/activities?per_page=200&page='+p);if(!Array.isArray(a)||!a.length)break;out.push(...a);if(a.length<200)break}
-  const rs=out.filter(a=>/Run/.test(a.sport_type||a.type)).map(a=>({id:'s'+a.id,date:a.start_date_local.replace('Z',''),km:+(a.distance/1000).toFixed(2),sec:a.moving_time,name:a.name,hr:a.average_heartrate,elev:a.total_elevation_gain,src:'strava'}));
-  state.runs=state.runs.filter(r=>r.src!=='strava').concat(rs);state.strava.last=Date.now();save();render();alert('Synced '+rs.length+' runs from Strava ('+out.length+' activities checked).')}catch(e){alert('Sync failed: '+e.message)}render()}
+  const rs=out.filter(a=>RUNTYPES.includes(a.sport_type||a.type)&&a.distance>0&&a.moving_time>0).map(a=>({id:'s'+a.id,date:a.start_date_local.replace('Z',''),km:+(a.distance/1000).toFixed(2),sec:a.moving_time,name:a.name,hr:a.average_heartrate,elev:a.total_elevation_gain,src:'strava'}));
+  state.runs=state.runs.filter(r=>r.src!=='strava').concat(rs);state.demo=false;dedupe();state.strava.last=Date.now();save();render();const left=await fetchBests();save();render();alert('Synced '+rs.length+' runs from Strava ('+out.length+' activities checked).'+(left?' '+left+' runs still need best efforts; tap Rebuild stats later (Strava rate limit).':''))}catch(e){alert('Sync failed: '+e.message)}render()}
 async function testConn(){diag=[];const c=state.cfg,s=state.strava;
- dlog(true,'App version r42-v2 · '+(STANDALONE?'home-screen app':'browser tab')+' · redirect '+APP_URL);
+ dlog(true,'App version r42-v3 · '+(STANDALONE?'home-screen app':'browser tab')+' · redirect '+APP_URL);
  dlog(!!c.cid&&/^\d+$/.test(c.cid),'Client ID saved'+(c.cid&&!/^\d+$/.test(c.cid)?' (should be digits only)':''));
  dlog(!!c.csec&&c.csec.length>=30,'Client Secret saved'+(c.csec&&c.csec.length<30?' (looks too short)':''));
  dlog(true,'Strava app must have Authorization Callback Domain = '+location.hostname);
@@ -90,8 +99,12 @@ function importGPX(t,fn){const x=new DOMParser().parseFromString(t,'application/
 /* ---------- analytics ---------- */
 function weekly(rs,n=16){const m0=monday(Date.now());const w=[];for(let i=n-1;i>=0;i--){const s=+m0-i*7*DAY;const r=rs.filter(x=>{const t=+new Date(x.date);return t>=s&&t<s+7*DAY});w.push({start:new Date(s),km:r.reduce((a,b)=>a+b.km,0),long:Math.max(0,...r.map(x=>x.km)),n:r.length})}return w}
 const riegel=(sec,km,to=M)=>sec*Math.pow(to/km,1.06);
-function pbs(rs){const o={};[[5,'5K'],[10,'10K'],[21.0975,'Half']].forEach(([d,l])=>{const c=rs.filter(r=>r.km>=d*.98);if(!c.length)return;const b=c.reduce((a,r)=>r.sec/r.km<a.sec/a.km?r:a);o[l]={t:b.sec/b.km*d,date:b.date,from:b.km}});return o}
-function predict(rs){const c=rs.filter(r=>r.km>=5&&+new Date(r.date)>Date.now()-120*DAY);if(!c.length)return null;let best=null;c.forEach(r=>{const p=riegel(r.sec,r.km);if(!best||p<best.t)best={t:p,r}});best.t*=1.05;return best}
+function pbs(rs){return BE.map(([l,d])=>{let b=null;rs.forEach(r=>{(state.be[r.id]||[]).forEach(([n,t])=>{if(n==l&&(!b||t<b.t))b={t,date:r.date,id:r.id,real:1}})});
+ if(!b){const c=rs.filter(r=>r.km>=d);if(c.length){const x=c.reduce((a,r)=>r.sec/r.km<a.sec/a.km?r:a);b={t:x.sec/x.km*d,date:x.date,id:x.id,real:0}}}return b&&{l,d,...b}}).filter(Boolean)}
+function predict(rs){const rec=rs.filter(r=>+new Date(r.date)>Date.now()-120*DAY);const src=[];
+ rec.forEach(r=>(state.be[r.id]||[]).forEach(([n,t])=>{const d=BE.find(x=>x[0]==n)?.[1];if(d>=5)src.push({t,km:d,r,real:1})}));
+ if(!src.length)rec.filter(r=>r.km>=5).forEach(r=>src.push({t:r.sec,km:r.km,r,real:0}));if(!src.length)return null;
+ let b=null;src.forEach(x=>{const p=riegel(x.t,x.km);if(!b||p<b.mt)b={...x,mt:p}});return{t:b.mt*1.05,r:b.r,src:b,at:d=>riegel(b.t,b.km,d)*1.05}}
 function readiness(rs){const w=weekly(rs,4),avg=w.reduce((a,b)=>a+b.km,0)/4,lg=Math.max(0,...rs.filter(r=>+new Date(r.date)>Date.now()-42*DAY).map(r=>r.km)),fr=w.reduce((a,b)=>a+b.n,0)/4;
  const v=Math.min(1,avg/55),l=Math.min(1,lg/32),f=Math.min(1,fr/4);return{score:Math.round(100*(.4*v+.4*l+.2*f)),avg,lg,fr,v,l,f}}
 
@@ -120,9 +133,10 @@ function chart(cv,vals,labels,{type='bar',color='#fc4c02',fmt=v=>v.toFixed(0),in
  else{g.strokeStyle=color;g.lineWidth=2;g.beginPath();let f=1;vals.forEach((x,i)=>{if(x==null)return;const X=P.l+i*bw+bw/2;f?g.moveTo(X,y(x)):g.lineTo(X,y(x));f=0});g.stroke();g.fillStyle=color;vals.forEach((x,i)=>{if(x!=null){g.beginPath();g.arc(P.l+i*bw+bw/2,y(x),3,0,7);g.fill()}})}}
 
 /* ---------- views ---------- */
+async function rebuild(){state.demo=false;dedupe();save();render();if(state.strava.access_token){try{const l=await fetchBests(100);alert(l?'Stats rebuilt. '+l+' runs still waiting for best efforts (Strava rate limit); try again in 15 min.':'Stats rebuilt from your Strava runs.')}catch(e){alert('Rebuild: '+e.message)}}save();render()}
 function setSrc(t){$('#src').textContent=t}
 function render(){const rs=runs();$('#demoBanner').classList.toggle('hidden',!state.demo);
- setSrc(state.demo?'Demo data':state.strava.access_token?'Strava ✓':rs.length?rs.length+' runs':'No data');
+ setSrc(state.demo?'Demo data':state.strava.access_token?'Strava ✓ '+rs.length+' runs':rs.length?rs.length+' runs':'No data');
  rDash(rs);rLog(rs);rPlan();rTips(rs);rSet()}
 function rDash(rs){const w=weekly(rs),r=readiness(rs),p=predict(rs),pb=pbs(rs),tot=rs.reduce((a,b)=>a+b.km,0),lg=rs.reduce((a,b)=>b.km>(a?.km||0)?b:a,null),ad=adherence();
  const race=state.plan?.race||state.cfg.race||DEF_RACE,dl=Math.ceil((new Date(race)-Date.now())/DAY);
@@ -133,15 +147,16 @@ function rDash(rs){const w=weekly(rs),r=readiness(rs),p=predict(rs),pb=pbs(rs),t
  <div class="card stat"><div class="k">This week</div><div class="v">${w.at(-1).km.toFixed(1)} km</div><div class="s">4-wk avg ${r.avg.toFixed(1)}</div></div>
  <div class="card stat"><div class="k">Total runs</div><div class="v">${rs.length}</div><div class="s">${tot.toFixed(0)} km total</div></div>
  <div class="card stat"><div class="k">Longest run</div><div class="v">${lg?lg.km.toFixed(1):0} km</div><div class="s">${lg?ymd(lg.date):'–'}</div></div>
- <div class="card stat"><div class="k">Marathon predictor</div><div class="v">${p?fmtT(p.t):'–'}</div><div class="s">${p?'Riegel +5% from '+p.r.km.toFixed(1)+' km':'needs a 5 km+ run'}</div></div>
+ <div class="card stat"><div class="k">Marathon predictor</div><div class="v">${p?fmtT(p.t):'–'}</div><div class="s">${p?'Riegel +5% from '+(p.src.real?'your '+fmtT(p.src.t)+' '+(BE.find(x=>x[1]==p.src.km)||[''])[0]+' best effort':'a '+p.r.km.toFixed(1)+' km run (estimate)'):'needs a 5 km+ run'}</div></div>
  <div class="card stat"><div class="k">Plan adherence</div><div class="v">${ad&&ad.due?Math.round(100*ad.done/ad.due)+'%':'–'}</div><div class="s">${ad?ad.done+'/'+ad.due+' sessions':'no plan yet'}</div></div></div>
- <div class="card"><h3>Personal bests (estimated)</h3><table><tr><th>Distance</th><th>Best est.</th><th>Pace</th><th>Marathon equiv.</th></tr>
- ${['5K','10K','Half'].map(k=>{const b=pb[k],d={'5K':5,'10K':10,Half:21.0975}[k];return`<tr><td>${k}</td><td>${b?fmtT(b.t):'–'}</td><td>${b?fmtP(b.t/d):'–'}</td><td>${b?fmtT(riegel(b.t,d)):'–'}</td></tr>`}).join('')}</table>
- <div class="muted">Estimated from your fastest average pace on runs at least that long; not official race results.</div></div>
+ <div class="card"><h3>Best efforts &amp; predictions</h3><div class="muted">Last synced: ${state.strava.last?new Date(state.strava.last).toLocaleString():'never'} <button id="rb" class="btn2">Rebuild stats</button></div>
+ <table><tr><th>Distance</th><th>Best</th><th>Pace</th><th>Date</th><th>Predicted now</th></tr>
+ ${pb.map(b=>`<tr><td>${b.l}</td><td>${fmtT(b.t)}${b.real?'':' <span class="muted">est.</span>'}</td><td>${fmtP(b.t/b.d)}</td><td>${String(b.id).startsWith('s')?`<a href="https://www.strava.com/activities/${b.id.slice(1)}" target="_blank" rel="noopener">${ymd(b.date)}</a>`:ymd(b.date)}</td><td>${p?fmtT(p.at(b.d)):'–'}</td></tr>`).join('')||'<tr><td colspan="5" class="muted">No runs yet. Sync Strava in Settings.</td></tr>'}</table>
+ <div class="muted">Best = Strava best efforts (fastest segment inside any run). "est." = no Strava best effort yet, estimated from a whole run's average pace. Predicted = Riegel from your strongest recent best effort, +5%.</div></div>
  <div class="charts"><div class="card"><h3>Weekly km (16 wks)</h3><canvas id="c1"></canvas></div><div class="card"><h3>Long run trend (km)</h3><canvas id="c2"></canvas></div>
  <div class="card"><h3>Avg pace per week (min/km)</h3><canvas id="c3"></canvas></div></div>`;
  const lb=w.map(x=>(x.start.getMonth()+1)+'/'+x.start.getDate());
- chart($('#c1'),w.map(x=>x.km),lb);chart($('#c2'),w.map(x=>x.long||null),lb,{type:'line',color:'#3fa9f5'});
+ $('#rb').onclick=rebuild;chart($('#c1'),w.map(x=>x.km),lb);chart($('#c2'),w.map(x=>x.long||null),lb,{type:'line',color:'#3fa9f5'});
  chart($('#c3'),w.map(x=>{const r2=rs.filter(r=>{const t=+new Date(r.date);return t>=+x.start&&t<+x.start+7*DAY});const k=r2.reduce((a,b)=>a+b.km,0);return k?r2.reduce((a,b)=>a+b.sec,0)/k:null}),lb,{type:'line',color:'#2ecc71',fmt:v=>fmtT(v),invert:true})}
 function rLog(rs){$('#v-log').innerHTML=`<div class="card"><h2>Run log <span class="ph">${rs.length}</span></h2><table><tr><th>Date</th><th>Run</th><th>km</th><th>Time</th><th>Pace</th><th></th></tr>
  ${rs.slice().reverse().map(r=>`<tr><td>${ymd(r.date)}</td><td>${esc(r.name)}${r.hr?` <span class="muted">♥${Math.round(r.hr)}</span>`:''}</td><td>${r.km.toFixed(2)}</td><td>${fmtT(r.sec)}</td><td>${fmtP(r.sec/r.km)}</td><td>${r.src=='demo'?'':`<a href="#" data-del="${r.id}">✕</a>`}</td></tr>`).join('')}</table></div>`;
